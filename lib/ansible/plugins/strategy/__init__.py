@@ -33,6 +33,7 @@ from ansible import constants as C
 from ansible.errors import AnsibleError, AnsibleParserError, AnsibleUndefinedVariable
 from ansible.executor.play_iterator import PlayIterator
 from ansible.executor.process.worker import WorkerProcess
+from ansible.executor.task_queue_manager import WorkerSlot
 from ansible.executor.task_result import TaskResult
 from ansible.inventory.host import Host
 from ansible.inventory.group import Group
@@ -188,12 +189,15 @@ class StrategyBase:
             # way to share them with the forked processes
             shared_loader_obj = SharedPluginLoaderObj()
 
+            # make sure the worker pool is safe
+            self._tqm.handle_dead_workers()
+
             queued = False
             while True:
-                (worker_prc, rslt_q) = self._workers[self._cur_worker]
-                if worker_prc is None or not worker_prc.is_alive():
+                (worker_slot, rslt_q) = self._workers[self._cur_worker]
+                if worker_slot.proc is None or not worker_slot.proc.is_alive():
                     worker_prc = WorkerProcess(rslt_q, task_vars, host, task, play_context, self._loader, self._variable_manager, shared_loader_obj)
-                    self._workers[self._cur_worker][0] = worker_prc
+                    self._workers[self._cur_worker][0] = WorkerSlot(proc=worker_prc, host=host, task=task)
                     worker_prc.start()
                     queued = True
                 self._cur_worker += 1
@@ -219,6 +223,7 @@ class StrategyBase:
 
         ret_results = []
 
+        self._tqm.handle_dead_workers()
         while not self._final_q.empty() and not self._tqm._terminated:
             try:
                 result = self._final_q.get()

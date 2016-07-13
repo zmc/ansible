@@ -23,10 +23,13 @@ import multiprocessing
 import os
 import tempfile
 
+from collections import namedtuple
+
 from ansible import constants as C
 from ansible.errors import AnsibleError
 from ansible.executor.play_iterator import PlayIterator
 from ansible.executor.process.result import ResultProcess
+from ansible.executor.task_result import TaskResult
 from ansible.executor.stats import AggregateStats
 from ansible.playbook.block import Block
 from ansible.playbook.play_context import PlayContext
@@ -45,6 +48,7 @@ except ImportError:
 
 __all__ = ['TaskQueueManager']
 
+WorkerSlot = namedtuple("WorkerSlot", "proc host task")
 
 class TaskQueueManager:
 
@@ -110,7 +114,7 @@ class TaskQueueManager:
 
         for i in range(num):
             rslt_q = multiprocessing.Queue()
-            self._workers.append([None, rslt_q])
+            self._workers.append([WorkerSlot(None, None, None), rslt_q])
 
         self._result_prc = ResultProcess(self._final_q, self._workers)
         self._result_prc.start()
@@ -290,11 +294,11 @@ class TaskQueueManager:
         if self._result_prc:
             self._result_prc.terminate()
 
-            for (worker_prc, rslt_q) in self._workers:
+            for (worker_slot, rslt_q) in self._workers:
                 rslt_q.close()
-                if worker_prc and worker_prc.is_alive():
+                if worker_slot.proc and worker_slot.proc.is_alive():
                     try:
-                        worker_prc.terminate()
+                        worker_slot.proc.terminate()
                     except AttributeError:
                         pass
 
@@ -311,10 +315,32 @@ class TaskQueueManager:
         return self._loader
 
     def get_workers(self):
-        return self._workers[:]
+        return self._workers
 
     def terminate(self):
         self._terminated = True
+
+    def handle_dead_workers(self):
+        display.debug("handling dead workers")
+        for idx, (worker_slot, rslt_q) in enumerate(self._workers):
+            if hasattr(worker_slot.proc, 'exitcode'):
+                if worker_slot.proc.exitcode in (-9, -15):
+                    tr = TaskResult(
+                        host=worker_slot.host,
+                        task=worker_slot.task,
+                        return_data=dict(
+                            failed=True,
+                            msg="The worker process handling this host died or was killed unexpectedly.",
+                        ),
+                    )
+                    rslt_q.put(tr)
+                    self._workers[idx][0] = WorkerSlot(None, None, None)
+        display.debug("done handling dead workers")
+
+        display.debug("checking to make sure the result proc is ok")
+        if hasattr(self._result_prc, 'exitcode') and self._result_prc.exitcode in (-9, -15):
+            raise AnsibleError("the result subprocess died unexpectedly, exiting")
+        display.debug("done checking to make sure the result proc is ok")
 
     def send_callback(self, method_name, *args, **kwargs):
         for callback_plugin in [self._stdout_callback] + self._callback_plugins:
